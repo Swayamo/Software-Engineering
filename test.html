@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Gesture PDF Controller</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <style>
+      body, html {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        font-family: Arial, sans-serif;
+      }
+      #app-container {
+        display: flex;
+        height: 100vh;
+        background-color: #f0f0f0;
+      }
+      #pdf-container {
+        flex-grow: 1;
+        display: flex;
+        flex-direction: column;
+        position: relative;
+        overflow: hidden;
+      }
+      #canvas-container {
+        flex-grow: 1;
+        position: relative;
+      }
+      #pdf-canvas, #annotation-canvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+      }
+      #annotation-canvas {
+        pointer-events: none;
+      }
+      #video-container {
+        width: 400px;
+        padding: 10px;
+        background-color: #f9f9f9;
+        display: flex;
+        flex-direction: column;
+      }
+      #webcam-video, #hand-canvas {
+        width: 100%;
+        transform: scaleX(-1);
+      }
+      #controls {
+        padding: 10px;
+        background-color: white;
+      }
+      #pointer {
+        position: absolute;
+        pointer-events: none;
+        z-index: 10;
+      }
+      #status-label, #page-label, #mode-label {
+        margin: 5px 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app-container">
+      <div id="pdf-container">
+        <div id="canvas-container">
+          <canvas id="pdf-canvas"></canvas>
+          <canvas id="annotation-canvas"></canvas>
+          <div id="pointer"></div>
+        </div>
+        <div id="controls">
+          <div id="page-label">No PDF loaded</div>
+          <div id="mode-label"></div>
+          <input type="file" id="pdf-upload" accept=".pdf" aria-label="Upload PDF" />
+        </div>
+      </div>
+      <div id="video-container">
+        <video id="webcam-video"></video>
+        <canvas id="hand-canvas"></canvas>
+        <div id="status-label" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <script>
+      pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+
+      class WebPDFController {
+        constructor() {
+          this.initializeElements();
+          this.initializeVariables();
+          this.setupHandTracking().catch((error) => {
+            console.error("Hand tracking setup failed:", error);
+            this.statusLabel.textContent =
+              "Hand tracking setup failed. Check console for details.";
+          });
+          this.setupEventListeners();
+          this.resizeCanvases();
+          window.addEventListener("resize", this.resizeCanvases.bind(this));
+        }
+
+        initializeElements() {
+          this.videoElement = document.getElementById("webcam-video");
+          this.handCanvas = document.getElementById("hand-canvas");
+          this.pdfCanvas = document.getElementById("pdf-canvas");
+          this.annotationCanvas = document.getElementById("annotation-canvas");
+          this.pdfUpload = document.getElementById("pdf-upload");
+          this.statusLabel = document.getElementById("status-label");
+          this.pageLabel = document.getElementById("page-label");
+          this.modeLabel = document.getElementById("mode-label");
+          this.pointerElement = document.getElementById("pointer");
+          this.canvasContainer = document.getElementById("canvas-container");
+          this.ctx = this.pdfCanvas.getContext("2d");
+          this.annotationCtx = this.annotationCanvas.getContext("2d");
+          this.handCtx = this.handCanvas.getContext("2d");
+        }
+
+        initializeVariables() {
+          this.pdfDoc = null;
+          this.currentPage = 0;
+          this.totalPages = 0;
+          this.drawingMode = "none";
+          this.lastX = null;
+          this.lastY = null;
+          this.penColor = "red";
+          this.penWidth = 2;
+          this.eraserWidth = 20;
+          this.gestureStartTime = null;
+          this.gestureHoldTime = 500;
+          this.gestureType = null;
+          this.scale = 1;
+          this.pointerHistory = [];
+          this.pointerHistoryMaxLength = 5;
+          this.pdfLoaded = false;
+        }
+
+        async setupHandTracking() {
+          this.hands = new Hands({
+            locateFile: (file) =>
+              `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+          });
+
+          this.hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+          });
+
+          this.hands.onResults(this.handleHandResults.bind(this));
+
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 640, height: 480 },
+          });
+
+          this.videoElement.srcObject = stream;
+          this.videoElement.addEventListener("loadedmetadata", () => {
+            this.videoElement.play();
+            this.startHandTracking();
+          });
+        }
+
+        startHandTracking() {
+          const sendFrame = async () => {
+            if (!this.videoElement.paused) {
+              await this.hands.send({ image: this.videoElement });
+            }
+            requestAnimationFrame(sendFrame);
+          };
+          sendFrame();
+        }
+
+        handleHandResults(results) {
+          this.clearHandCanvas();
+
+          if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            results.multiHandLandmarks.forEach((landmarks, index) => {
+              this.drawHandLandmarks({ multiHandLandmarks: [landmarks] });
+
+              if (index === 0) {
+                this.detectAndHandleGestures(landmarks);
+              }
+            });
+
+            this.statusLabel.textContent = `Detected ${results.multiHandLandmarks.length} hand(s)`;
+          } else {
+            this.statusLabel.textContent = "No hands detected";
+            this.resetPointer();
+          }
+        }
+
+        detectAndHandleGestures(landmarks) {
+          const { gesture, isValid } = this.identifyGesture(landmarks);
+
+          if (isValid) {
+            const indexTip = landmarks[8];
+            const indexBase = landmarks[5];
+
+            if (indexTip.y < indexBase.y) {
+              this.updatePointer(indexTip.x, indexTip.y);
+            }
+
+            if (gesture === "pen" || gesture === "eraser") {
+              this.handleDrawing(landmarks, gesture);
+            } else if (gesture === "next" || gesture === "prev") {
+              this.handlePageTurning(gesture);
+            }
+          } else {
+            this.resetPointer();
+          }
+        }
+
+        identifyGesture(landmarks) {
+          const tips = [8, 12, 16, 20].map((index) => landmarks[index]);
+          const bases = [5, 9, 13, 17].map((index) => landmarks[index]);
+
+          const isUp = tips.map((tip, i) => tip.y < bases[i].y - 0.1);
+          const fingersUpCount = isUp.filter(Boolean).length;
+
+          if (fingersUpCount === 1 && isUp[0]) {
+            return { gesture: "pen", isValid: true };
+          }
+          if (fingersUpCount === 2 && isUp[0] && isUp[1]) {
+            return { gesture: "eraser", isValid: true };
+          }
+          if (fingersUpCount >= 3) {
+            return { gesture: "next", isValid: true };
+          }
+          if (fingersUpCount === 0) {
+            return { gesture: "prev", isValid: true };
+          }
+
+          return { gesture: null, isValid: false };
+        }
+
+        handleDrawing(landmarks, mode) {
+          const indexTip = landmarks[8];
+          const canvasX = indexTip.x * this.annotationCanvas.width;
+          const canvasY = indexTip.y * this.annotationCanvas.height;
+
+          const adjustedX = this.annotationCanvas.width - canvasX;
+          const adjustedY = canvasY;
+
+          if (
+            adjustedX < 0 ||
+            adjustedX > this.annotationCanvas.width ||
+            adjustedY < 0 ||
+            adjustedY > this.annotationCanvas.height
+          ) {
+            return;
+          }
+
+          if (mode === "eraser") {
+            this.annotationCtx.globalCompositeOperation = "destination-out";
+            this.annotationCtx.lineWidth = this.eraserWidth;
+          } else {
+            this.annotationCtx.globalCompositeOperation = "source-over";
+            this.annotationCtx.strokeStyle = this.penColor;
+            this.annotationCtx.lineWidth = this.penWidth;
+          }
+
+          this.annotationCtx.lineCap = "round";
+
+          if (this.lastX !== null && this.lastY !== null) {
+            this.annotationCtx.beginPath();
+            this.annotationCtx.moveTo(this.lastX, this.lastY);
+            this.annotationCtx.lineTo(adjustedX, adjustedY);
+            this.annotationCtx.stroke();
+          }
+
+          this.lastX = adjustedX;
+          this.lastY = adjustedY;
+          this.drawingMode = mode;
+          this.updateModeLabel(mode);
+        }
+
+        handlePageTurning(gesture) {
+          if (!this.pdfDoc) return;
+
+          const now = Date.now();
+          if (!this.gestureStartTime) {
+            this.gestureStartTime = now;
+            this.gestureType = gesture;
+          }
+
+          const holdDuration = now - this.gestureStartTime;
+          if (holdDuration >= this.gestureHoldTime) {
+            if (gesture === "next" && this.currentPage < this.totalPages - 1) {
+              this.currentPage++;
+              this.renderPDFPage();
+            } else if (gesture === "prev" && this.currentPage > 0) {
+              this.currentPage--;
+              this.renderPDFPage();
+            }
+            this.gestureStartTime = null;
+          }
+        }
+
+        updateModeLabel(mode) {
+          this.modeLabel.textContent = `Mode: ${
+            mode.charAt(0).toUpperCase() + mode.slice(1)
+          }`;
+        }
+
+        updatePointer(x, y) {
+          if (!this.pdfLoaded) return;
+
+          const pointerSize = 10;
+          this.pointerElement.style.display = "block";
+
+          const pdfRect = this.pdfCanvas.getBoundingClientRect();
+          const pointerX = (1 - x) * pdfRect.width;
+          const pointerY = y * pdfRect.height;
+
+          this.pointerHistory.push({ x: pointerX, y: pointerY });
+          if (this.pointerHistory.length > this.pointerHistoryMaxLength) {
+            this.pointerHistory.shift();
+          }
+
+          const smoothedPosition = this.smoothPointerPosition();
+
+          this.pointerElement.style.left = `${smoothedPosition.x}px`;
+          this.pointerElement.style.top = `${smoothedPosition.y}px`;
+          this.pointerElement.style.width = `${pointerSize}px`;
+          this.pointerElement.style.height = `${pointerSize}px`;
+          this.pointerElement.style.backgroundColor = "red";
+          this.pointerElement.style.position = "absolute";
+          this.pointerElement.style.transform = "translate(-50%, -50%)";
+          this.pointerElement.style.borderRadius = "50%";
+        }
+
+        smoothPointerPosition() {
+          const sum = this.pointerHistory.reduce(
+            (acc, pos) => ({ x: acc.x + pos.x, y: acc.y + pos.y }),
+            { x: 0, y: 0 }
+          );
+          return {
+            x: sum.x / this.pointerHistory.length,
+            y: sum.y / this.pointerHistory.length,
+          };
+        }
+
+        resetPointer() {
+          this.pointerElement.style.display = "none";
+          this.pointerHistory = [];
+        }
+
+        clearHandCanvas() {
+          this.handCtx.clearRect(
+            0,
+            0,
+            this.handCanvas.width,
+            this.handCanvas.height
+          );
+        }
+
+        drawHandLandmarks(results) {
+          if (results.multiHandLandmarks) {
+            for (const landmarks of results.multiHandLandmarks) {
+              drawConnectors(this.handCtx, landmarks, HAND_CONNECTIONS, {
+                color: "#00FF00",
+                lineWidth: 5,
+              });
+              drawLandmarks(this.handCtx, landmarks, {
+                color: "#FF0000",
+                lineWidth: 2,
+              });
+            }
+          }
+        }
+
+        setupEventListeners() {
+          this.pdfUpload.addEventListener("change", this.loadPDF.bind(this));
+        }
+
+        async loadPDF(event) {
+          const file = event.target.files[0];
+          if (file) {
+            try {
+              const fileReader = new FileReader();
+              fileReader.onload = async (e) => {
+                const typedarray = new Uint8Array(e.target.result);
+                this.pdfDoc = await pdfjsLib.getDocument({ data: typedarray }).promise;
+                this.totalPages = this.pdfDoc.numPages;
+                this.currentPage = 1;
+                this.pdfLoaded = true;
+                this.renderPDFPage();
+              };
+              fileReader.readAsArrayBuffer(file);
+            } catch (error) {
+              console.error("Error loading PDF:", error);
+              alert("Failed to load PDF. Please try again.");
+            }
+          }
+        }
+
+        resizeCanvases() {
+          const containerWidth = this.canvasContainer.clientWidth;
+          const containerHeight = this.canvasContainer.clientHeight;
+
+          this.pdfCanvas.width = containerWidth;
+          this.pdfCanvas.height = containerHeight;
+          this.annotationCanvas.width = containerWidth;
+          this.annotationCanvas.height = containerHeight;
+
+          if (this.pdfDoc) {
+            this.renderPDFPage();
+          }
+        }
+
+        async renderPDFPage() {
+          if (!this.pdfDoc) return;
+
+          try {
+            const page = await this.pdfDoc.getPage(this.currentPage);
+            const viewport = page.getViewport({ scale: 1 });
+
+            const containerWidth = this.canvasContainer.clientWidth;
+            const containerHeight = this.canvasContainer.clientHeight;
+
+            const scaleX = containerWidth / viewport.width;
+            const scaleY = containerHeight / viewport.height;
+            this.scale = Math.min(scaleX, scaleY);
+
+            const scaledViewport = page.getViewport({ scale: this.scale });
+
+            this.pdfCanvas.width = scaledViewport.width;
+            this.pdfCanvas.height = scaledViewport.height;
+            this.annotationCanvas.width = scaledViewport.width;
+            this.annotationCanvas.height = scaledViewport.height;
+
+            this.ctx.clearRect(0, 0, this.pdfCanvas.width, this.pdfCanvas.height);
+            this.annotationCtx.clearRect(0, 0, this.annotationCanvas.width, this.annotationCanvas.height);
+
+            const renderContext = {
+              canvasContext: this.ctx,
+              viewport: scaledViewport,
+            };
+
+            await page.render(renderContext).promise;
+
+            this.pageLabel.textContent = `Page: ${this.currentPage} / ${this.totalPages}`;
+          } catch (error) {
+            console.error("Error rendering PDF page:", error);
+          }
+        }
+      }
+
+      window.addEventListener("load", () => {
+        new WebPDFController();
+      });
+    </script>
+  </body>
+</html>
